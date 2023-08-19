@@ -5,6 +5,10 @@
 #include "SD.h"
 #include "SPI.h"
 
+// i2c expand Objects
+#include "PCF8574.h"
+PCF8574 pcf8574(0x20);
+
 // ADC Objects
 #include "ADS1X15.h"
 ADS1115 ADS(0x48);
@@ -23,9 +27,14 @@ static lv_obj_t *DateTime_label;
 
 lv_timer_t *timer;
 
+/* ========================== RTC ========================== */
+#include <Wire.h>
+#include <DS3231.h>
+RTClib myRTC;
+
 /* ====================== DEEP SLEEP CONFIG ======================== */
 #define uS_TO_S_FACTOR 1000000
-int TIME_TO_SLEEP = 600; // 10 minutes sleep
+int TIME_TO_SLEEP = 500; // 10 minutes sleep
 
 RTC_DATA_ATTR unsigned int bootCount = 0;
 
@@ -43,38 +52,65 @@ Separador s;
 /* ====================== MQTT CONFIG ======================== */
 // #include <WiFi.h>
 
-//const char *ssid = "INTERNET D-13";
-const char *ssid = "UNONU UM52";
-//const char *password = "20600680901";
-const char *password = "12345678";
+/* GPRS - mqtt */
+#define MODEM_TX 3 // 16
+#define MODEM_RX 1 //17
+const char apn[] = "claro.pe";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+//const char gprsUser[] = "claro@datos";
+//const char gprsPass[] = "claro";
 
-WiFiClient client;
+#define SerialAT Serial
+
+#define TINY_GSM_MODEM_SIM800   // Modem is SIM800
+#define TINY_GSM_RX_BUFFER 2048 // Set RX buffer to 1Kb
+
+#include <TinyGsmClient.h>
+
+#ifdef DUMP_AT_COMMANDS
+#include <StreamDebugger.h>
+StreamDebugger debugger(SerialAT, SerialMon);
+TinyGsm modem(debugger);
+#else
+TinyGsm modem(SerialAT);
+#endif
+
+TinyGsmClient client(modem);
+
+//const char *ssid = "UNONU UM52";
+//const char *password = "12345678";
+//WiFiClient client;
+
 #include <PubSubClient.h>
 
 PubSubClient mqtt(client);
-
-const char *broker = "broker.emqx.io";
-//const char *broker = "broker.hivemq.com";
+//const char *broker = "broker.emqx.io";
+const char *broker = "broker.hivemq.com";
 const int mqtt_port = 1883;
-const char *mqtt_id = "gle_client_234:::#122";
+const char *mqtt_id = "gle_client96486522";
 const char *mqtt_user = "gle";
 const char *mqtt_pass = "glettxx";
-
 const char *topicSubscribe = "jphOandG/";
-
-// const char *topicSubscribe = "oilAIOT/field/Well01";
 const char *topicPublish = "jphOandG/data";
 
 // ================== GENERALS VARIABLES ======================
-boolean mode_acquire = false;
+boolean acquire_mode = false; // 1: CC1: WIRE - 0: CC3 ESP_NOW
+boolean transmission_mode = false; // 1: sim - 0: wifi
+
 int tmp_n = 0;
 float tmp_acc, tmp_load;
-uint8_t flag; // 0: start, 1: payload, 2: end
-String dt;
+uint8_t flag; // 0: start, 1: payload, 2: end SEPARE ONE STROKE
+String dt; // Date time
+String payload = "";
+Average<float> load(50); // final chart
+Average<float> pos(50); //
 
+float runTime = 0;
+float runTimeFactor = 11.13333/60; // factor to get runtime
 // Diagnosis tips
-float v_diagnosis[10];
-String label_diagnosis[10] = {"full pump","leak travel valve","leak standing valve","worn pump barrel","light fluid stroke","medium fluid stroke","severe fluid stroke","gas interference","shock of pump up","shock of pump down"};
+float v_diagnosis[11] {0,0,0,0,0,0,0,0,0,0,0};
+String label_diagnosis[11] = {"full pump","leak travel valve","leak standing valve","worn pump barrel","light fluid stroke","medium fluid stroke","severe fluid stroke","gas interference","shock of pump up","shock of pump down","rods broken"};
 float fill;
 float a0[50] = {-0.161094, 0.133767, 0.509254, 0.586077, 0.588004, 0.572422, 0.577633, 0.567187, 0.58284, 0.574648, 0.567952, 0.564416, 0.566411, 0.591799, 0.592944, 0.584578, 0.607816, 0.609944, 0.606361, 0.607037, 0.625326, 0.663207, 0.661868, 0.597974, 0.369072, 0.179431, -0.0484264, -0.113182, -0.097836, -0.0759193, -0.0531394, -0.0452247, -0.0245321, -0.0140658, -0.010772, -0.0177663, -0.0145408, -0.00956059, -0.0108517, 0.00724792, 0.0163409, 0.0166782, 0.0187881, 0.0292116, 0.0331711, 0.0459051, 0.0554916, -0.0497948, -0.202742, -0.291714};
 float pp[50] = {0.00, 0.00410499, 0.01635257, 0.03654162, 0.06434065,
@@ -88,8 +124,7 @@ float pp[50] = {0.00, 0.00410499, 0.01635257, 0.03654162, 0.06434065,
        0.29760833, 0.24080372, 0.1882551 , 0.14082532, 0.09929319,
        0.06434065, 0.03654162, 0.01635257, 0.00410499, 0.00};
 
-String WellName = "3310";
-String DateTime = "aaaa/mm/dd hh:mm";
+String WellName = "TEST1";
 String Diagnosis = "--";
 String FillPump = "--";
 String SPM = "--";
@@ -99,11 +134,13 @@ String status = "--";
 
 String Load = "--";
 String Pos = "--";
+String logging = "";
+
 int mode = 0; // 0: standAlone 1: endPoint (internet connect)
 
-const int8_t pinCC1W = 1;
+long previousMillis = 0;
 
-long previousMillis = 0; 
+uint32_t lastReconnectAttempt = 0;
 
 float f; // adc to mV
 
@@ -112,23 +149,23 @@ int16_t i_start, i_end;
 unsigned long start_time;
 unsigned long end_time;
 
-const int16_t read_n_max = 1500; //700
+const int16_t read_n_max = 800; //700
 const int16_t chart_n_max = 700;
-float FillPumpList[300];
-float dtFillPumpList[300];
 
-float alpha_p = 0.05;
-float alpha_l = 0.08;
-float filter_value_pos = 284.4;
-float filter_value_load = 155;
+Average<float> FillPumpList(300);
+Average<float> dtFillPumpList(300);
+
+int16_t nRecords = 0;
+
+float alpha_p = 0.1;
+float alpha_l = 0.1;
+float filter_value_pos = 250;
+float filter_value_load = 99.8;
 //float load_bottom[559] = {4.09, 4.14, 4.18, 4.22, 4.25, 4.29, 4.33, 4.37, 4.42, 4.47, 4.51, 4.57, 4.62, 4.66, 4.72, 4.76, 4.79, 4.83, 4.88, 4.92, 4.97, 5.01, 5.06, 5.12, 5.17, 5.21, 5.26, 5.3, 5.34, 5.38, 5.42, 5.46, 5.49, 5.52, 5.54, 5.55, 5.55, 5.54, 5.53, 5.52, 5.51, 5.5, 5.49, 5.47, 5.45, 5.43, 5.41, 5.39, 5.36, 5.34, 5.32, 5.3, 5.28, 5.26, 5.24, 5.23, 5.21, 5.19, 5.17, 5.16, 5.16, 5.16, 5.17, 5.18, 5.2, 5.22, 5.24, 5.26, 5.28, 5.3, 5.33, 5.35, 5.38, 5.41, 5.43, 5.45, 5.47, 5.49, 5.5, 5.5, 5.52, 5.53, 5.54, 5.55, 5.56, 5.56, 5.57, 5.57, 5.57, 5.56, 5.55, 5.53, 5.52, 5.49, 5.47, 5.44, 5.41, 5.38, 5.35, 5.32, 5.3, 5.28, 5.26, 5.25, 5.24, 5.23, 5.23, 5.22, 5.21, 5.21, 5.21, 5.21, 5.21, 5.21, 5.21, 5.22, 5.23, 5.24, 5.25, 5.26, 5.27, 5.29, 5.31, 5.33, 5.35, 5.38, 5.4, 5.42, 5.43, 5.44, 5.44, 5.44, 5.44, 5.44, 5.44, 5.44, 5.43, 5.42, 5.4, 5.39, 5.38, 5.37, 5.37, 5.37, 5.36, 5.35, 5.33, 5.31, 5.29, 5.27, 5.25, 5.22, 5.2, 5.18, 5.17, 5.16, 5.14, 5.13, 5.13, 5.13, 5.13, 5.14, 5.16, 5.18, 5.19, 5.21, 5.23, 5.25, 5.27, 5.28, 5.29, 5.31, 5.33, 5.35, 5.37, 5.38, 5.4, 5.42, 5.43, 5.45, 5.46, 5.48, 5.5, 5.51, 5.52, 5.53, 5.53, 5.53, 5.53, 5.51, 5.49, 5.48, 5.46, 5.45, 5.44, 5.43, 5.42, 5.4, 5.38, 5.37, 5.36, 5.35, 5.34, 5.34, 5.34, 5.34, 5.34, 5.33, 5.32, 5.31, 5.3, 5.31, 5.32, 5.33, 5.34, 5.36, 5.37, 5.39, 5.42, 5.45, 5.46, 5.48, 5.5, 5.52, 5.53, 5.54, 5.55, 5.56, 5.57, 5.57, 5.57, 5.57, 5.56, 5.57, 5.58, 5.58, 5.59, 5.59, 5.6, 5.6, 5.59, 5.59, 5.57, 5.57, 5.55, 5.54, 5.53, 5.53, 5.51, 5.5, 5.48, 5.47, 5.47, 5.47, 5.47, 5.47, 5.48, 5.49, 5.5, 5.51, 5.52, 5.52, 5.53, 5.53, 5.53, 5.53, 5.53, 5.53, 5.53, 5.53, 5.52, 5.5, 5.48, 5.45, 5.41, 5.36, 5.31, 5.27, 5.22, 5.17, 5.13, 5.08, 5.04, 5.01, 4.96, 4.93, 4.89, 4.86, 4.83, 4.8, 4.76, 4.73, 4.71, 4.66, 4.63, 4.6, 4.56, 4.54, 4.51, 4.48, 4.45, 4.42, 4.39, 4.36, 4.34, 4.32, 4.3, 4.28, 4.27, 4.26, 4.26, 4.26, 4.25, 4.25, 4.26, 4.25, 4.25, 4.25, 4.26, 4.26, 4.26, 4.27, 4.27, 4.28, 4.28, 4.29, 4.29, 4.3, 4.3, 4.3, 4.3, 4.3, 4.3, 4.3, 4.29, 4.29, 4.28, 4.27, 4.27, 4.26, 4.26, 4.25, 4.25, 4.25, 4.24, 4.24, 4.24, 4.24, 4.23, 4.23, 4.22, 4.21, 4.21, 4.21, 4.21, 4.21, 4.21, 4.22, 4.22, 4.23, 4.24, 4.25, 4.26, 4.28, 4.29, 4.31, 4.33, 4.35, 4.36, 4.37, 4.38, 4.39, 4.4, 4.41, 4.42, 4.42, 4.43, 4.45, 4.45, 4.46, 4.47, 4.48, 4.49, 4.5, 4.5, 4.5, 4.49, 4.48, 4.47, 4.47, 4.46, 4.46, 4.46, 4.45, 4.45, 4.44, 4.43, 4.43, 4.43, 4.43, 4.43, 4.43, 4.44, 4.45, 4.45, 4.46, 4.46, 4.47, 4.47, 4.48, 4.48, 4.49, 4.5, 4.51, 4.52, 4.53, 4.55, 4.56, 4.57, 4.58, 4.59, 4.6, 4.6, 4.62, 4.63, 4.65, 4.65, 4.66, 4.66, 4.66, 4.65, 4.64, 4.63, 4.62, 4.59, 4.56, 4.53, 4.49, 4.43, 4.37, 4.32, 4.25, 4.18, 4.1, 4.02, 3.95, 3.88, 3.82, 3.76, 3.7, 3.64, 3.59, 3.53, 3.48, 3.42, 3.36, 3.31, 3.26, 3.21, 3.16, 3.11, 3.06, 3.0, 2.96, 2.92, 2.9, 2.9, 2.89, 2.9, 2.92, 2.94, 2.96, 2.98, 3.0, 3.02, 3.04, 3.05, 3.06, 3.08, 3.1, 3.13, 3.16, 3.19, 3.22, 3.24, 3.26, 3.28, 3.3, 3.32, 3.34, 3.34, 3.36, 3.35, 3.34, 3.32, 3.29, 3.26, 3.22, 3.19, 3.17, 3.14, 3.12, 3.09, 3.08, 3.06, 3.04, 3.02, 2.99, 2.97, 2.94, 2.92, 2.91, 2.9, 2.89, 2.87, 2.87, 2.86, 2.86, 2.87, 2.88, 2.91, 2.94, 2.98, 3.01, 3.05, 3.09, 3.13, 3.17, 3.2, 3.23, 3.25, 3.26, 3.28, 3.3, 3.32, 3.35, 3.38, 3.41, 3.44, 3.46, 3.49, 3.52, 3.54, 3.56, 3.58, 3.6, 3.6, 3.59, 3.6, 3.61, 3.63, 3.65, 3.67, 3.69, 3.71, 3.73, 3.75, 3.79, 3.82};
 //float pos_bottom[559] = {0.0, 0.0, 0.01, 0.01, 0.02, 0.03, 0.05, 0.07, 0.09, 0.11, 0.13, 0.16, 0.19, 0.22, 0.26, 0.3, 0.34, 0.38, 0.43, 0.48, 0.53, 0.58, 0.64, 0.7, 0.76, 0.83, 0.89, 0.96, 1.04, 1.11, 1.19, 1.27, 1.35, 1.43, 1.52, 1.61, 1.7, 1.8, 1.89, 1.99, 2.09, 2.2, 2.3, 2.41, 2.53, 2.64, 2.75, 2.87, 2.99, 3.12, 3.24, 3.37, 3.5, 3.63, 3.76, 3.9, 4.04, 4.18, 4.32, 4.47, 4.61, 4.76, 4.91, 5.07, 5.22, 5.38, 5.54, 5.7, 5.86, 6.03, 6.19, 6.36, 6.53, 6.7, 6.88, 7.05, 7.23, 7.41, 7.59, 7.78, 7.96, 8.15, 8.33, 8.52, 8.71, 8.91, 9.1, 9.3, 9.49, 9.69, 9.89, 10.1, 10.3, 10.5, 10.7, 10.9, 11.1, 11.3, 11.5, 11.8, 12.0, 12.2, 12.4, 12.6, 12.8, 13.0, 13.3, 13.5, 13.7, 13.9, 14.2, 14.4, 14.6, 14.8, 15.1, 15.3, 15.5, 15.7, 16.0, 16.2, 16.4, 16.7, 16.9, 17.1, 17.4, 17.6, 17.8, 18.1, 18.3, 18.5, 18.8, 19.0, 19.2, 19.5, 19.7, 19.9, 20.2, 20.4, 20.6, 20.9, 21.1, 21.4, 21.6, 21.8, 22.1, 22.3, 22.5, 22.8, 23.0, 23.2, 23.5, 23.7, 23.9, 24.2, 24.4, 24.6, 24.9, 25.1, 25.3, 25.6, 25.8, 26.0, 26.3, 26.5, 26.7, 26.9, 27.2, 27.4, 27.6, 27.8, 28.1, 28.3, 28.5, 28.7, 29.0, 29.2, 29.4, 29.6, 29.8, 30.0, 30.2, 30.5, 30.7, 30.9, 31.1, 31.3, 31.5, 31.7, 31.9, 32.1, 32.3, 32.5, 32.7, 32.9, 33.1, 33.3, 33.5, 33.7, 33.9, 34.0, 34.2, 34.4, 34.6, 34.8, 34.9, 35.1, 35.3, 35.5, 35.6, 35.8, 36.0, 36.1, 36.3, 36.5, 36.6, 36.8, 36.9, 37.1, 37.2, 37.4, 37.5, 37.7, 37.8, 38.0, 38.1, 38.2, 38.4, 38.5, 38.6, 38.8, 38.9, 39.0, 39.1, 39.2, 39.4, 39.5, 39.6, 39.7, 39.8, 39.9, 40.0, 40.1, 40.2, 40.3, 40.4, 40.5, 40.6, 40.7, 40.7, 40.8, 40.9, 41.0, 41.0, 41.1, 41.2, 41.2, 41.3, 41.4, 41.4, 41.5, 41.5, 41.6, 41.6, 41.7, 41.7, 41.7, 41.8, 41.8, 41.8, 41.9, 41.9, 41.9, 41.9, 42.0, 42.0, 42.0, 42.0, 42.0, 42.0, 42.0, 42.0, 42.0, 42.0, 42.0, 42.0, 42.0, 41.9, 41.9, 41.9, 41.9, 41.8, 41.8, 41.8, 41.7, 41.7, 41.7, 41.6, 41.6, 41.5, 41.5, 41.4, 41.4, 41.3, 41.2, 41.2, 41.1, 41.0, 41.0, 40.9, 40.8, 40.7, 40.7, 40.6, 40.5, 40.4, 40.3, 40.2, 40.1, 40.0, 39.9, 39.8, 39.7, 39.6, 39.5, 39.4, 39.2, 39.1, 39.0, 38.9, 38.8, 38.6, 38.5, 38.4, 38.2, 38.1, 38.0, 37.8, 37.7, 37.5, 37.4, 37.2, 37.1, 36.9, 36.8, 36.6, 36.5, 36.3, 36.1, 36.0, 35.8, 35.6, 35.5, 35.3, 35.1, 34.9, 34.8, 34.6, 34.4, 34.2, 34.0, 33.9, 33.7, 33.5, 33.3, 33.1, 32.9, 32.7, 32.5, 32.3, 32.1, 31.9, 31.7, 31.5, 31.3, 31.1, 30.9, 30.7, 30.5, 30.2, 30.0, 29.8, 29.6, 29.4, 29.2, 29.0, 28.7, 28.5, 28.3, 28.1, 27.8, 27.6, 27.4, 27.2, 26.9, 26.7, 26.5, 26.3, 26.0, 25.8, 25.6, 25.3, 25.1, 24.9, 24.6, 24.4, 24.2, 23.9, 23.7, 23.5, 23.2, 23.0, 22.8, 22.5, 22.3, 22.1, 21.8, 21.6, 21.4, 21.1, 20.9, 20.6, 20.4, 20.2, 19.9, 19.7, 19.5, 19.2, 19.0, 18.8, 18.5, 18.3, 18.1, 17.8, 17.6, 17.4, 17.1, 16.9, 16.7, 16.4, 16.2, 16.0, 15.7, 15.5, 15.3, 15.1, 14.8, 14.6, 14.4, 14.2, 13.9, 13.7, 13.5, 13.3, 13.0, 12.8, 12.6, 12.4, 12.2, 12.0, 11.8, 11.5, 11.3, 11.1, 10.9, 10.7, 10.5, 10.3, 10.1, 9.89, 9.69, 9.49, 9.3, 9.1, 8.91, 8.71, 8.52, 8.33, 8.15, 7.96, 7.78, 7.59, 7.41, 7.23, 7.05, 6.88, 6.7, 6.53, 6.36, 6.19, 6.03, 5.86, 5.7, 5.54, 5.38, 5.22, 5.07, 4.91, 4.76, 4.61, 4.47, 4.32, 4.18, 4.04, 3.9, 3.76, 3.63, 3.5, 3.37, 3.24, 3.12, 2.99, 2.87, 2.75, 2.64, 2.53, 2.41, 2.3, 2.2, 2.09, 1.99, 1.89, 1.8, 1.7, 1.61, 1.52, 1.43, 1.35, 1.27, 1.19, 1.11, 1.04, 0.96, 0.89, 0.83, 0.76, 0.7, 0.64, 0.58, 0.53, 0.48, 0.43, 0.38, 0.34, 0.3, 0.26, 0.22, 0.19, 0.16, 0.13, 0.11, 0.09, 0.07, 0.05, 0.03, 0.02, 0.01, 0.01, 0.0, 0.0};
 
 Average<float> acc_raw(read_n_max);
 Average<float> load_raw(read_n_max);
-
-//float load_raw[read_n_max];
-//float pos_raw[read_n_max];
 
 float load_surf[chart_n_max];
 float pos_surf[chart_n_max];
@@ -141,155 +178,80 @@ float pos_bottom[chart_n_max];
 /* ************************************************************************************************************** */
 
 /* ====================== SDCARD FUNCTIONS ======================== */
-void appendFile(fs::FS &fs, const char * path, const char * message){
-  //Serial.printf("Appending to file: %s\n", path);
+void appendFile(fs::FS &fs, const char *path, const char *message)
+{
+    //Serial.printf("Appending to file: %s\n", path);
 
-  File file = fs.open(path, FILE_APPEND);
-  file.println(message);
-  /*
-  if(!file){
-    Serial.println("Failed to open file for appending");
-    return;
-  }
-  if(file.print(message)){
-      Serial.println("Message appended");
-  } else {
-    Serial.println("Append failed");
-  }*/
-  file.close();
+    File file = fs.open(path, FILE_APPEND, true);
+    file.println(message);
+    /*
+    if(!file){
+      Serial.println("Failed to open file for appending");
+      return;
+    }
+    if(file.print(message)){
+        Serial.println("Message appended");
+    } else {
+      Serial.println("Append failed");
+    }
+    */
+    file.close();
 }
 
-/* ====================== MQTT FUNCTIONS ======================== */
-void mqttCallback(char *topic, byte *payload, unsigned int length);
-void reconnect();
-void OperationScreen(int16_t numberData, int16_t numberDataFill);
-
-void mqttCallback(char *topic, byte *payload, unsigned int length)
+void readFile(fs::FS &fs, const char *path)
 {
-    if (String(topic) == String(topicSubscribe) + String(WellName) + "/config")
+    StaticJsonDocument<2048> doc;
+
+    File file = fs.open(path);
+    if (!file)
     {
-        String msg_in = "";
-        for (int i = 0; i < length; i++)
-        {
-            msg_in += String((char)payload[i]);
-        }
-        TIME_TO_SLEEP = msg_in.toInt();
+        //Serial.println("Failed to open file for reading");
+        File fileR = fs.open(path, FILE_APPEND, true);
+        file.println("CREATE FILE");
+        //if(!fileR)Serial.println("File not create");
+        file.close();
+        return;
     }
 
-    if (String(topic) == String(topicSubscribe) + String(WellName) + "/data")
+    while (file.available())
     {
+        String lineJson = file.readStringUntil('\n');
+        DeserializationError error = deserializeJson(doc, lineJson);
 
-        DynamicJsonDocument doc(8000);
-
-        String json = "";
-        for (int i = 0; i < length; i++)
-        {
-            json += String((char)payload[i]);
-        }
-
-        //Serial.println(json);
-
-        DeserializationError error = deserializeJson(doc, json);
-
-        if (error)
-        {
-            delay(10);
+        if (error) {
+            //Serial.print(F("deserializeJson() failed: "));
+            //Serial.println(error.f_str());
             return;
         }
 
+        const char* ldt = doc["dt"];
+        String t_ldt = s.separa(String(ldt),' ',1);
+        dtFillPumpList.push(s.separa(t_ldt,':',0).toFloat() + s.separa(t_ldt,':',1).toFloat() / 60.00);
+        FillPumpList.push(doc["f"]);
 
-        String WN = doc["well"]; WellName = WN;
-        String DT = doc["DT"]; DateTime = DT;
-        String diag = doc["diagnosis"]; Diagnosis = diag;
-        String st = doc["status"]; status = st;
-
-        String fillPump = doc["fillPump"];
-        String dtFillPump = doc["dtFillPump"];
-
-        int16_t numberDataFill = s.separa(fillPump, ',', 0).toInt();
-
-        FillPump = s.separa(fillPump, ',', numberDataFill);
-
-        for (uint32_t i = 0; i <= numberDataFill; i++)
-        {
-            FillPumpList[i] = s.separa(fillPump, ',', i + 1).toFloat();
-            dtFillPumpList[i] = s.separa(dtFillPump, ',', i).toFloat();
-        }
-
-        int16_t numberData = 0;
-
-        if(String(status) == "running"){
-            String pos_s = doc["pos"];
-            String load_s = doc["load"];
-            String SPM_c = doc["SPM"]; SPM = String(SPM_c);
-
-            numberData = s.separa(pos_s, ',', 0).toInt();
-            for (uint32_t i = 0; i <= numberData; i++)
-            {
-                pos_bottom[i] = s.separa(pos_s, ',', i + 1).toFloat();
-                load_bottom[i] = s.separa(load_s, ',', i).toFloat();
-            }
-        }
-
-        //Serial.println(String(numberData) + ":" + String(str_pos_bottom));
-
-        OperationScreen(numberData, numberDataFill);
-        lv_timer_handler();
-        smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 0, .red = 0}}));
-        delay(20000);
-        digitalWrite(pinCC1W,LOW);
-        gpio_hold_en(GPIO_NUM_1);
-
-        digitalWrite(17,LOW);
-        gpio_hold_en(GPIO_NUM_17);
-
-        digitalWrite(4,LOW);
-        gpio_hold_en(GPIO_NUM_4);
-
-        digitalWrite(16,LOW);
-        gpio_hold_en(GPIO_NUM_16);
-
-        gpio_deep_sleep_hold_en();
-        esp_deep_sleep_start();
+        if(doc["status"] == "running") runTime += runTimeFactor; 
+        
+        nRecords++;
+        // Serial.write(file.read());
     }
+    file.close();
+    //Serial.println("records: " + String(nRecords));
 }
 
-/* ******************* RECONNECT  ********************** */
-void reconnect()
+/* ====================== Callback ======================== */
+void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
-    int count = 0;
-    while (!mqtt.connected())
+  if (String(topic) == String(topicSubscribe) + String(WellName) + "/config")
+  {
+    String msg_in = "";
+    for (int i = 0; i < length; i++)
     {
-        if (mqtt.connect(mqtt_id, mqtt_user, mqtt_pass, topicPublish, 0, false, "Device conected"))
-        {
-            char topic1[25];
-            String topicSubscribe1 = topicSubscribe + WellName + "/data";
-            topicSubscribe1.toCharArray(topic1, (topicSubscribe1.length() + 1));
-            mqtt.subscribe(topic1);
-            // Serial.println(topicSubscribe1);
-
-            delay(100);
-
-            char topic2[25];
-            String topicSubscribe2 = topicSubscribe + WellName + "/config";
-            topicSubscribe2.toCharArray(topic2, (topicSubscribe2.length() + 1));
-            mqtt.subscribe(topic2);
-            // Serial.println(topicSubscribe2);
-        }
-        else
-        {
-            smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 255, .green = 0, .red = 255}}));
-            if (count == 5)
-            {
-                ESP.restart();
-            }
-            delay(5000);
-        }
-        count++;
+      msg_in += String((char)payload[i]);
     }
+    TIME_TO_SLEEP = msg_in.toInt();
+  }
 }
-
-/* ************************* SETUP WIFI ************************** */
+/* ************************* SETUP WIFI ************************** 
 void setup_wifi()
 {
     WiFi.begin(ssid, password);
@@ -307,6 +269,91 @@ void setup_wifi()
     }
 
     delay(2000);
+}
+*/
+
+/* ******************* RECONNECT  ********************** */
+boolean mqttConnect(){
+  boolean status = mqtt.connect(mqtt_id, mqtt_user, mqtt_pass);
+
+  if (status == false){
+    ESP.restart();
+    return false;
+  }
+  String topicS = topicSubscribe + WellName + "/#";
+  mqtt.subscribe(topicS.c_str());
+
+  return mqtt.connected();
+}
+
+void reconnect()
+{
+  int count = 0;
+  while (!mqtt.connected())
+  {
+    uint32_t t = millis();
+    if (t - lastReconnectAttempt > 10000L) {
+      lastReconnectAttempt = t;
+      if (mqttConnect()) {
+        lastReconnectAttempt = 0;
+      }
+    }
+  }
+}
+
+/* ============================== SETUP GRPS ============================== */
+boolean setup_grps()
+{
+  // Set GSM module baud rate and UART pins
+  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(3000);
+
+  modem.restart();
+
+  String modemInfo = modem.getModemInfo();
+  //Serial.println(modemInfo);
+
+  if (modemInfo == "")
+  {
+    smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 0, .red = 255}}));
+    return false;
+  }
+  /* */
+  if (!modem.waitForNetwork(240000L))
+  {
+    smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 0, .red = 255}}));
+    delay(1000);
+    smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 0, .red = 0}}));
+    delay(1000);
+    smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 0, .red = 255}}));
+    return false;
+  }
+  
+  if (modem.isNetworkConnected())
+  {
+    smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 255, .red = 0}}));
+  }
+  else
+  {
+    return false;
+  }
+
+  if (!modem.gprsConnect(apn))
+  //if (!modem.gprsConnect(apn, gprsUser, gprsPass))
+  {
+    //Serial.println("grps fail");
+    return false;
+  }
+  else
+  {
+    smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 255, .red = 0}}));
+    delay(1000);
+    smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 0, .red = 0}}));
+    delay(1000);
+    smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 255, .red = 0}}));
+    //Serial.println("grps ok"); // sim  grps ok
+    return true;
+  }
 }
 
 /* ====================================================================================== */
@@ -337,7 +384,6 @@ void diagnosis()
     /* NN variables */
     // float a0[50];
 
-    Serial.println("--------a");
     float W1[15][50] = {{-0.665, -0.618, -0.007, 0.067, -0.158, -0.053, 0.093, 0.248, -0.03, 0.53, 0.254, -0.104, 0.244, 0.254, 0.487, 0.121, 0.479, 0.383, 0.409, 0.185, 0.587, 0.493, 0.282, -0.13, 0.322, 0.386, 0.371, -0.194, -0.373, -0.686, -0.351, -0.127, 0.278, 0.047, 0.287, 0.349, -0.013, 0.169, 0.394, 1.148, 1.182, 1.415, 0.364, -0.439, -0.717, -0.295, -0.351, 0.387, 1.054, 0.735}, {-0.608, -0.306, -0.135, 0.904, -0.184, -0.358, -0.417, -0.97, -0.074, 0.055, 0.432, 0.411, 0.099, 0.081, -0.035, 0.097, 0.162, -0.178, -0.079, 0.41, -0.21, 0.264, 0.556, 0.006, 0.233, -0.247, -0.171, 0.04, 0.903, 0.85, 0.068, -0.403, 0.114, 0.286, 0.065, -0.341, -0.528, -0.35, -0.126, -0.465, -1.132, -0.642, -0.528, 0.556, 1.327, 1.251, 0.288, -0.056, -1.015, -1.187}, {-0.161, 0.119, 0.09, 0.041, -0.248, -0.068, -0.298, 0.14, 0.03, 0.261, 0.364, -0.122, 0.232, 0.581, 0.199, 0.026, 0.551, 0.142, -0.021, 0.004, 0.164, -0.04, 0.582, 0.27, 0.173, 0.461, 0.113, -0.328, -0.501, -0.348, -0.389, -0.238, -0.045, 0.011, 0.177, -0.522, -0.089, -0.074, 0.097, -0.019, -0.575, -0.155, 0.001, -0.013, 0.815, 0.426, 0.194, -0.454, -1.346, -0.838}, {-1.106, -0.07, -0.403, -0.232, 0.187, -0.006, 0.302, 0.005, 0.202, 0.012, 0.168, 0.229, 0.077, 0.04, 0.399, 0.246, 0.324, 0.208, 0.457, 0.424, 0.013, 0.052, 0.05, -0.179, 0.01, -0.019, 0.273, 0.094, -0.592, -0.081, 0.03, -0.302, -0.038, -0.162, -0.462, 0.193, -0.474, 0.035, -0.152, 0.016, 0.542, 0.348, 0.002, -0.012, -1.171, -0.781, -0.247, 0.363, 1.231, 0.58}, {-0.099, 0.424, -0.204, -0.457, 0.067, 0.523, 0.354, 0.326, 0.336, 0.412, 0.424, 0.198, -0.055, 0.548, 0.08, 0.541, 0.208, 0.184, 0.239, -0.16, 0.149, 0.137, 0.049, -0.398, 0.081, -0.39, 0.138, 0.218, 0.471, -0.03, 0.192, -0.079, -0.003, -0.116, -0.015, 0.002, 0.118, 0.059, 0.18, 0.245, 0.473, 0.541, 0.713, 1.017, 0.959, -0.275, 0.16, -0.946, -0.818, -1.245}, {0.665, -0.154, 0.335, -0.077, 0.312, 0.288, -0.026, -0.331, 0.242, 0.21, 0.065, 0.115, -0.092, -0.119, -0.039, 0.305, -0.178, 0.033, -0.23, -0.179, 0.326, 0.06, 0.062, -0.088, 0.339, 0.236, -0.006, -0.039, 0.684, 0.246, 0.821, 0.308, -0.289, 0.574, 0.268, 0.567, 0.497, 0.299, -0.343, -0.527, 0.187, -0.194, -0.894, -0.967, -0.715, -0.031, -0.071, 1.115, 1.272, 1.472}, {-0.376, 0.569, -0.434, -0.512, -0.361, 0.228, 0.178, 0.487, 0.134, 0.228, 0.274, 0.412, -0.143, 0.258, -0.055, 0.175, 0.203, 0.315, 0.022, 0.187, -0.273, -0.04, 0.194, -0.214, 0.124, 0.081, 0.343, -0.328, -0.106, -0.119, -0.221, 0.163, -0.381, 0.126, 0.044, 0.191, 0.015, 0.085, 0.173, 0.765, 1.548, 1.05, 1.327, 0.479, -0.455, -0.363, 0.251, -1.001, -0.574, -0.88}, {-1.49, -0.317, 0.072, -0.132, -0.327, -0.498, 0.465, -0.094, 0.111, -0.101, -0.297, -0.356, 0.41, 0.193, 0.163, -0.14, 0.196, 0.153, 0.353, 0.094, 0.519, 0.246, -0.038, 0.202, -0.495, -0.231, 0.06, -0.993, -1.315, -1.028, -0.056, 0.476, 0.259, 0.356, -0.291, 0.372, 0.203, 0.485, 0.219, -0.217, 0.038, 0.247, 0.008, -0.199, -1.054, -1.005, -0.852, 0.083, 0.888, -0.265}, {0.019, 0.175, -0.157, 0.39, -0.124, -0.465, -0.32, -0.447, -0.219, -0.341, 0.268, -0.174, 0.191, -0.207, 0.128, 0.231, -0.202, 0.107, -0.119, -0.058, -0.198, -0.216, 0.124, -0.234, -0.174, -0.223, 0.271, 0.352, 0.053, 0.795, 0.448, 0.886, 0.243, 0.727, 0.685, 0.246, 1.007, 0.608, 0.758, 0.204, -0.21, -0.165, -0.086, 0.674, 0.571, 0.132, 0.135, -0.443, -0.6, -0.135}, {-0.251, -0.131, 0.622, 0.841, 0.299, -0.152, -0.378, -0.508, -0.296, -0.948, -0.869, -0.444, -0.118, 0.164, 0.114, -0.175, 0.01, 0.434, 0.59, 0.299, 0.447, 0.237, 0.358, 0.341, 0.204, -0.272, -0.008, 0.064, -0.018, 0.901, 0.841, -0.63, -1.338, -1.959, -2.413, -1.12, -0.051, -0.602, -0.381, -0.356, -0.599, -0.633, -0.834, -0.268, -0.378, -0.567, -0.476, 0.273, 1.39, 0.406}, {0.842, 0.412, 0.227, 0.073, 0.205, 0.241, -0.053, -0.255, -0.395, -0.381, 0.235, -0.289, 0.144, -0.196, -0.222, -0.312, 0.167, 0.271, 0.421, -0.184, 0.133, 0.25, -0.256, 0.142, 0.104, -0.13, 0.391, 0.051, 0.558, 0.705, 0.457, 0.473, -0.324, -0.344, -0.157, -0.174, -0.171, -0.15, -0.554, -0.287, 1.529, 1.104, 0.711, 0.673, -0.374, -0.242, -0.654, 0.466, 1.359, 0.617}, {0.76, -0.249, -0.12, 0.419, -0.025, -0.579, 0.216, -0.212, -0.156, -0.015, -0.05, 0.432, -0.238, 0.183, 0.242, -0.021, -0.002, 0.113, 0.201, 0.023, 0.014, 0.169, 0.312, 0.247, -0.056, 0.135, -0.004, 0.007, 0.574, 0.462, 0.286, 0.277, 0.246, 0.499, 0.61, 0.159, 0.22, 0.04, 0.633, 0.292, -0.395, -0.425, -0.607, -0.717, -0.421, -0.716, -0.603, -0.137, 0.862, 1.008}, {0.156, -0.01, -0.296, -0.013, -0.412, 0.174, 0.019, -0.371, 0.118, -0.01, 0.129, -0.416, -0.297, 0.128, -0.025, -0.422, -0.358, 0.213, 0.176, 0.032, 0.234, 0.284, 0.217, 0.375, -0.101, 0.082, -0.371, 0.102, 0.135, 0.04, -0.18, -0.081, -0.009, -0.345, 0.051, -0.058, 0.091, -0.182, -0.259, -0.048, -0.189, 0.131, -0.177, 0.053, -0.126, 0.121, 0.067, 0.019, -0.08, -0.152}, {0.042, -0.553, 0.368, 0.632, 0.541, 0.065, -0.24, -0.089, 0.134, 0.08, -0.364, 0.041, 0.11, -0.352, 0.02, 0.124, -0.137, -0.399, 0.035, 0.054, -0.186, 0.49, 0.605, 0.298, 0.721, 0.473, 0.402, 0.098, 0.303, 0.399, 0.108, 0.453, 0.194, 0.009, -0.08, -0.345, -0.38, -0.237, -0.267, -0.543, -0.719, -0.893, -1.63, -1.652, -0.649, 0.441, -0.36, 1.206, 1.622, 1.762}, {0.276, 0.229, 0.282, 0.318, 0.624, 0.082, 0.139, 0.738, 0.54, 0.436, 0.222, -0.348, -0.196, -0.578, -0.321, -0.679, -0.849, -0.486, -0.609, -0.414, -0.6, -0.412, -0.091, -0.173, -0.5, -0.068, 0.588, 0.076, -0.036, 0.19, 0.422, -0.528, -0.64, -0.169, -0.525, -0.367, -0.743, -0.622, -1.089, -0.833, -0.428, -0.571, -1.231, -0.996, -0.87, -0.001, -0.338, 0.365, -0.065, -0.847}};
     float a1[15];
     float W2[10][15] = {{0.449, -0.577, 0.694, 0.656, 0.033, -0.58, 0.186, 1.735, -1.684, -0.556, 0.025, -0.383, -0.32, -0.083, -1.59}, {-0.302, -0.243, 0.178, -0.058, -0.114, -0.449, -0.694, -0.476, -0.133, -1.245, 0.086, -0.016, 0.328, -0.619, -0.55}, {-0.098, -0.659, -0.546, 0.197, -0.542, -0.132, 0.162, -0.605, 0.057, -0.198, -0.112, -0.154, 0.181, -0.378, -0.906}, {-0.335, -0.843, -0.127, -0.428, -0.488, -0.526, -0.403, -0.931, -0.118, -0.677, -0.528, -0.578, -0.271, -0.086, -0.51}, {-0.771, 0.376, -0.637, 0.189, 0.041, -0.028, -1.285, -1.278, 0.182, 1.208, 1.067, -0.006, -0.191, 0.33, -2.253}, {-0.163, 0.651, 0.659, -1.294, -0.723, -0.077, -1.053, 0.193, 0.533, -1.554, -2.058, 0.638, -0.228, 0.504, -2.301}, {-0.334, -1.489, -0.617, -0.171, 0.784, -0.246, 0.459, 0.464, 0.225, -0.684, 1.395, 0.267, -0.177, -1.121, -0.885}, {-1.241, 0.576, 0.528, -0.097, -0.006, -0.269, 0.314, -2.552, 0.656, -0.08, 0.09, -0.591, 0.262, -0.355, -0.27}, {0.079, -0.198, 0.227, -0.641, -0.164, 0.189, -0.477, -1.408, -1.596, -1.651, -0.321, -0.276, 0.27, 0.241, 0.973}, {-0.275, 1.414, 0.865, -0.927, 0.75, -0.976, 0.175, -0.888, 0.203, -0.892, -1.281, -0.286, -0.256, -1.092, -1.81}};
@@ -346,7 +392,6 @@ void diagnosis()
     float b2[10] = {-0.478, -0.21, -0.207, -0.259, -0.115, 0.281, -0.565, 0.024, -0.101, 0.437};
     float aux = 0.0;
 
-    Serial.println("--------b");
 
     /* ***** Neural network running ***** */
     for (int i = 0; i < 15; i++)
@@ -410,9 +455,8 @@ void fillPump()
 }
 
 /* ********************** MAIN PROCCESS *********************** */
+void AcquisitionScreen_0(int16_t numberData, int16_t numberDataFill);
 void dataProcess(){
-    //Serial.println("melitya - " + String(cnt));
-
 /* ----------------- Preprocessing service ----------------- */
     float maxAcc = 0;
     float minAcc = 0;
@@ -429,25 +473,17 @@ void dataProcess(){
     maxLoad = load_raw.maximum(&max_load_index);
     minLoad = load_raw.minimum(&min_load_index);
 
-    Average<float> load(50);
-    Average<float> pos(50);
-
       /* ************ Detect pump stopped service ************ */
-    if ((maxAcc - minAcc) <= 5)
+    if ((maxAcc - minAcc) <= 30)
     {
         status = "stopped";
-        Serial.println("stopped");
-    }
-    else if (abs(maxLoad - minLoad) <= 10)
-    {
-        status = "running";
-        Serial.println("rods broken");
-    }
-    else
+        for(int8_t i = 0; i < 50; i++){
+            pp[i] = 0;
+        }
+    }else
     {
         /* ************ Separe stroke ************ */
         status = "running";
-        Serial.println("Separe stroke");
 
         float value;
         int16_t i_start = 0;
@@ -491,33 +527,24 @@ void dataProcess(){
             }
         }
 
-        Serial.println("acc: " + String(minAcc) + "," + String(maxAcc) + "; mmin index " + String(i_start) + " min index: " + String(i_end));
-
         /* ************ detect stroke integrity ************ */
         if (i_start == 0 || i_end == 0)
         {
-            Serial.println("Incomplete dynachart.");
-            Serial.println("------------------ end");
-            //digitalWrite(pinSimReset, LOW);
-            //gpio_hold_en(GPIO_NUM_4);
-            //gpio_deep_sleep_hold_en();
-            //modem.sleepEnable(true);
-            // modem.poweroff();
-            
+            logging = "Incomplete dynachart";
             return;
         }
 
         // ======== get min and peak ========        
         PeakLoad = String(maxLoad,2);
         MinLoad = String(minLoad,2);
-        SPM = String(60000.00/(35.00*(i_end - i_start)),2);
+        SPM = String(60000.00/(25.00*(i_end - i_start)),2);
 
-        // ======== TRACE IN  STROKE ========        
-        load_ser->y_points[i_start + 1] = 1600;
-        load_ser->y_points[i_end + 1] = 1600;
+        // ======== TRACE STROKE ========        
+        load_ser->y_points[i_start + 1] = 1050;
+        load_ser->y_points[i_end + 1] = 1050;
 
-        pos_ser->y_points[i_start + 1] = 0;
-        pos_ser->y_points[i_end + 1] = 0;
+        pos_ser->y_points[i_start + 1] = 2450;
+        pos_ser->y_points[i_end + 1] = 2450;
 
         lv_chart_refresh(loadChart);
         lv_chart_refresh(posChart);
@@ -528,66 +555,121 @@ void dataProcess(){
         /* ************ resize array to 50 ************ */
         float length = float(i_end - i_start) / 49.00;
 
-        // Average<float> load(50);
-        // Average<float> pos(50);
-
         float temp;
         int index;
         for (int i = 0; i < 49; i++)
         {
             index = i_start + i * length;
-            // temp = mapfloat(load_raw.get(index),0,300,0,6.5);
-            load.push(load_raw.get(index));
-            pos.push(acc_raw.get(index));
-            Serial.print(String(acc_raw.get(index)) + ",");
-            // a0[i] = temp;
+            temp = mapfloat(load_raw.get(index),990.00,8000.00,0.00,2500.00);
+            load.push(temp);
+
+            temp = mapfloat(acc_raw.get(index),2400.00,2550.00,0.00,200.00);
+            pos.push(temp);
+            //pos.push(acc_raw.get(index)-240.00);
         }
 
-        temp = mapfloat(load_raw.get(i_end), 0, 300, 0, 6.5);
-        Serial.println(String(acc_raw.get(i_end)));
-
-        pos.push(acc_raw.get(i_end));
+        temp = mapfloat(load_raw.get(i_end), 990.00, 8000.00, 0.00,2500.00);
         load.push(temp);
+        
+        temp = mapfloat(acc_raw.get(i_end),2400.00,2550.00,0.00,200.00);
+        //pos.push(acc_raw.get(index)-240.00);
+        pos.push(temp);
+        
         // a0[49] = temp;
 
-        /* ************ NN for diagnosis ************ */
-        diagnosis();
-        for (int i = 0; i < 10; i++)
-        {
-            Serial.print(String(v_diagnosis[i]) + ",");
+        if (abs(maxLoad - minLoad) <= 3){
+            v_diagnosis[10] = 1;
+            fill = 0;
+        }else{
+            /* ************ NN for diagnosis ************ */
+            diagnosis();
+
+            /* ************ NN for fillpump ************ */
+            fillPump();
         }
-
-        Serial.println();
-
-        /* ************ NN for fillpump ************ */
-        fillPump();
-        Serial.println(String(fill));
-
         
     }
 
-    OperationScreen(50, 50);
-
-    for(int i = 0; i < 10; i++)
-    {
-        lv_timer_handler();
-    }
-    
     smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 0, .red = 0}}));
-    delay(20000);
-    //digitalWrite(pinCC1W,LOW);
-    //gpio_hold_en(GPIO_NUM_1);
+    delay(5000);
 
-    //digitalWrite(17,LOW);
-    //gpio_hold_en(GPIO_NUM_17);
+    AcquisitionScreen_0(50, nRecords);
+    lv_timer_handler();
+    lv_timer_handler();
+}
 
-    //digitalWrite(4,LOW);
-    //gpio_hold_en(GPIO_NUM_4);
+/* ********************** SEND MESSAGE *********************** */
+void saveSendDate(String t_dt)
+{
+    payload = "";
+    StaticJsonDocument<2048> doc;
+    doc["well"] = WellName;
+    doc["status"] = status;
+    doc["dt"] = dt;
+    if (status == "stopped")
+    {
+        doc["f"] = 0;
+        doc["SPM"] = 0;
+    }else if(logging == "Incomplete dynachart"){
+        doc["log"] = logging;
+    }
+    else{
+        if(v_diagnosis[10] == 1){ /// rods broken
+            JsonArray diag = doc.createNestedArray("diag");
+            diag.add(10);
+            doc["f"] = 0;
+        }else{
+            doc["f"] = serialized(String(fill, 2));
+            JsonArray diag = doc.createNestedArray("diag");
+            for (int8_t i = 0; i < 11; i++)
+            {
+                if (v_diagnosis[i] > 0.8) // tresholder 0.7
+                {
+                    diag.add(i);
+                }
+            }
+        }
+        
+        JsonArray p = doc.createNestedArray("p");
+        JsonArray l = doc.createNestedArray("l");
 
-    //digitalWrite(16,LOW);
-    gpio_hold_en(GPIO_NUM_16);
+        for (int i = 0; i < 50; i++)
+        {
+            p.add((float)((int)round(pos.get(i))) * 0.01);
+            l.add((float)((int)round(load.get(i))) * 0.01);
+        }
+    }
 
-    gpio_deep_sleep_hold_en();
+    serializeJson(doc, payload);
+    appendFile(SD, t_dt.c_str(), payload.c_str());
+
+    delay(50);
+    String acc_r = "";
+    float ta;
+    for (int i = 0; i < read_n_max; i++){
+        ta = mapfloat(acc_raw.get(i),2400.00,2550.00,0.00,200.00);
+        acc_r += String(ta*0.01,2) + ",";
+    }
+    appendFile(SD, t_dt.c_str(), acc_r.c_str());
+
+    if (transmission_mode)
+    {
+        pcf8574.digitalWrite(P2, HIGH); // 
+        delay(1000);
+
+        setup_grps();
+        mqtt.setServer(broker, mqtt_port);
+        mqtt.setCallback(mqttCallback);
+        reconnect();
+        mqtt.publish(topicPublish, payload.c_str());
+        delay(500);
+        modem.sleepEnable(true);
+        pcf8574.digitalWrite(P2, LOW);
+        gpio_deep_sleep_hold_en();
+    }
+
+    //Serial.println(payload);
+    delay(10000);
     esp_deep_sleep_start();
 }
 
@@ -598,12 +680,9 @@ static void add_data(lv_timer_t *timer)
     static uint32_t cnt = 0;
 
     filter_value_pos = (alpha_p * ADS.readADC(0) * f) + ((1 - alpha_p) * filter_value_pos);
-    filter_value_load = (alpha_l * (ADS.readADC(1) - 7270)) + ((1 - alpha_l) * filter_value_load);
-    acc_raw.push(filter_value_pos);
-    load_raw.push(filter_value_load);
-
-    //pos_raw[cnt] = 5.5;
-    //load_raw[cnt] = 6.6;
+    filter_value_load = (alpha_l * (ADS.readADC(1)* f)) + ((1 - alpha_l) * filter_value_load);
+    acc_raw.push(filter_value_pos * 10);
+    load_raw.push(filter_value_load * 10);
     
     if (cnt % 5 == 0)
     {
@@ -614,34 +693,10 @@ static void add_data(lv_timer_t *timer)
         Load = String(load_raw.get(cnt),1);
         lv_label_set_text(label_box_load, Load.c_str());
     }
-    lv_chart_set_next_value(posChart, pos_ser, acc_raw.get(cnt) * 10);
-    lv_chart_set_next_value(loadChart, load_ser, load_raw.get(cnt) * 10);
+    lv_chart_set_next_value(posChart, pos_ser, acc_raw.get(cnt));
+    lv_chart_set_next_value(loadChart, load_ser, load_raw.get(cnt));
 
     cnt++;
-}
-
-static void add_data_ESPNOW_copy(lv_timer_t *timer)
-{
-    /*
-    LV_UNUSED(timer);
-    static uint32_t cnt = 0;
-
-    pos_raw[cnt] = tmp_acc;
-    load_raw[cnt] = tmp_load;
-
-    if (cnt % 5 == 0)
-    {
-        Pos = String(pos_raw[cnt],1);
-        lv_label_set_text(label_box_pos, Pos.c_str());
-
-        Load = String(load_raw[cnt],1);
-        lv_label_set_text(label_box_load, Load.c_str());
-    }
-    lv_chart_set_next_value(posChart, pos_ser, pos_raw[cnt]*10);
-    lv_chart_set_next_value(loadChart, load_ser, load_raw[cnt]*10);
-
-    cnt++;
-    */
 }
 
 static void add_data_ESPNOW(lv_timer_t *timer)
@@ -650,7 +705,7 @@ static void add_data_ESPNOW(lv_timer_t *timer)
     static uint32_t cnt = 0;
 
     if(flag == 0){
-        Serial.println(dt);
+        //Serial.println(dt);
         lv_label_set_text(DateTime_label, dt.c_str());
 
     }else if(flag == 1){
@@ -667,8 +722,8 @@ static void add_data_ESPNOW(lv_timer_t *timer)
             Load = String(tmp_load,1);
             lv_label_set_text(label_box_load, Load.c_str());
         }
-        lv_chart_set_next_value(posChart, pos_ser, tmp_acc*10);
-        lv_chart_set_next_value(loadChart, load_ser, tmp_load);
+        lv_chart_set_next_value(posChart, pos_ser, tmp_acc*1);
+        lv_chart_set_next_value(loadChart, load_ser, tmp_load*1);
         
         cnt++;
     }else if(flag == 2){
@@ -678,7 +733,7 @@ static void add_data_ESPNOW(lv_timer_t *timer)
 }
 
 /* ************************* ACQUISITION SCREEN ************************ */
-void AcquisitionScreen()
+void AcquisitionScreen(int16_t numberData, int16_t numberDataFill)
 {
     // Clear screen
     lv_obj_clean(lv_scr_act());
@@ -700,11 +755,11 @@ void AcquisitionScreen()
 
     // Set label to DateTime
     DateTime_label = lv_label_create(lv_scr_act());
-    lv_obj_set_pos(DateTime_label, 85, 5);
+    lv_obj_set_pos(DateTime_label, 90, 5);
     lv_obj_set_style_text_color(DateTime_label, lv_palette_main(LV_PALETTE_BROWN), LV_STATE_DEFAULT);
     lv_label_set_long_mode(DateTime_label, LV_LABEL_LONG_WRAP); /*Break the long lines*/
     lv_obj_set_style_text_font(DateTime_label, &lv_font_montserrat_22, LV_STATE_DEFAULT);
-    lv_label_set_text(DateTime_label, DateTime.c_str());
+    lv_label_set_text(DateTime_label, dt.c_str());
 
     // ***************** Set label to message *****************
     Acquisition_label = lv_label_create(lv_scr_act());
@@ -721,7 +776,7 @@ void AcquisitionScreen()
     lv_obj_set_style_text_color(span_load_label, lv_palette_main(LV_PALETTE_BROWN), LV_STATE_DEFAULT);
     lv_label_set_long_mode(span_load_label, LV_LABEL_LONG_WRAP); /*Break the long lines*/
     lv_obj_set_style_text_font(span_load_label, &lv_font_montserrat_14, LV_STATE_DEFAULT);
-    lv_label_set_text(span_load_label,"Load (Klb): ");
+    lv_label_set_text(span_load_label,"Load (mV): ");
 
     // Create BOX to load value
     auto back_box_load = lv_obj_create(lv_scr_act());
@@ -744,9 +799,9 @@ void AcquisitionScreen()
     lv_chart_set_type(loadChart, LV_CHART_TYPE_LINE);
     lv_chart_set_update_mode(loadChart, LV_CHART_UPDATE_MODE_CIRCULAR);
     load_ser = lv_chart_add_series(loadChart, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
-    lv_chart_set_range(loadChart, LV_CHART_AXIS_PRIMARY_Y, -10000, 0);
+    lv_chart_set_range(loadChart, LV_CHART_AXIS_PRIMARY_Y, 980,1100);
     lv_chart_set_axis_tick(loadChart, LV_CHART_AXIS_PRIMARY_Y, 10, 5, 6, 2, true, 50);
-    lv_chart_set_point_count(loadChart, 400);
+    lv_chart_set_point_count(loadChart, 800);
 
      // Create spam acc label
     auto span_acc_label = lv_label_create(lv_scr_act());
@@ -754,7 +809,7 @@ void AcquisitionScreen()
     lv_obj_set_style_text_color(span_acc_label, lv_palette_main(LV_PALETTE_BROWN), LV_STATE_DEFAULT);
     lv_label_set_long_mode(span_acc_label, LV_LABEL_LONG_WRAP); /*Break the long lines*/
     lv_obj_set_style_text_font(span_acc_label, &lv_font_montserrat_14, LV_STATE_DEFAULT);
-    lv_label_set_text(span_acc_label,"Position: ");
+    lv_label_set_text(span_acc_label,"acc (mV): ");
 
     // Create BOX to acc value
     auto back_box_acc = lv_obj_create(lv_scr_act());
@@ -777,13 +832,13 @@ void AcquisitionScreen()
     lv_chart_set_type(posChart, LV_CHART_TYPE_LINE); /*Show lines and points too*/
     lv_chart_set_update_mode(posChart, LV_CHART_UPDATE_MODE_CIRCULAR);
     pos_ser = lv_chart_add_series(posChart, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
-    lv_chart_set_range(posChart, LV_CHART_AXIS_PRIMARY_Y, 5200, 5500);
+    lv_chart_set_range(posChart, LV_CHART_AXIS_PRIMARY_Y, 2450, 2550);
     lv_chart_set_axis_tick(posChart, LV_CHART_AXIS_PRIMARY_Y, 10, 5, 6, 2, true, 50);
-    lv_chart_set_point_count(posChart, 400);
+    lv_chart_set_point_count(posChart, 800);
 
-    if(mode_acquire){
-        //lv_timer_t *timer = lv_timer_create(add_data, 2, NULL);
-        //lv_timer_set_repeat_count(timer, read_n_max - 1);
+    if(acquire_mode){
+        lv_timer_t *timer = lv_timer_create(add_data, 2, NULL);
+        lv_timer_set_repeat_count(timer, read_n_max - 1);
     }else{
         timer = lv_timer_create(add_data_ESPNOW, 2, NULL);
         //lv_timer_set_repeat_count(timer, read_n_max + 3);
@@ -791,8 +846,7 @@ void AcquisitionScreen()
     
 }
 
-/* ************************* OPERATION SCREEN ************************ */
-void OperationScreen(int16_t numberData, int16_t numberDataFill)
+void AcquisitionScreen_0(int16_t numberData, int16_t numberDataFill)
 {
     // Clear screen
     lv_obj_clean(lv_scr_act());
@@ -820,8 +874,6 @@ void OperationScreen(int16_t numberData, int16_t numberDataFill)
     lv_label_set_long_mode(DateTime_label, LV_LABEL_LONG_WRAP); /*Break the long lines*/
     lv_obj_set_style_text_font(DateTime_label, &lv_font_montserrat_22, LV_STATE_DEFAULT);
 
-    //char payloadDT[20];
-    //DateTime.toCharArray(payloadDT, (DateTime.length() + 1));
     lv_label_set_text(DateTime_label, dt.c_str());
 
     // ***************** Set label to Diagnosis *****************
@@ -832,19 +884,224 @@ void OperationScreen(int16_t numberData, int16_t numberDataFill)
     lv_obj_set_width(Diagnosis_label, 300);
     lv_obj_set_style_text_font(Diagnosis_label, &lv_font_montserrat_22, LV_STATE_DEFAULT);
 
-    //char payloadDignosis[100];
-    //Diagnosis.toCharArray(payloadDignosis, (Diagnosis.length() + 1));
+    String Label_diagnosis = "";
+    if(status == "stopped"){
+        Label_diagnosis = status;
+    }else{
+        for (int i = 0; i < 10; i++)
+        {
+            if(v_diagnosis[i] < 0.7){
+                Label_diagnosis += label_diagnosis[i] + " - ";
+            }
+        }
+    }
+    
+    lv_label_set_text(Diagnosis_label, Label_diagnosis.c_str());
+
+    // ***************** Create dynachart *****************
+    lv_obj_t *dynachart = lv_chart_create(lv_scr_act());
+    lv_obj_set_pos(dynachart, 45, 65);
+    lv_obj_set_size(dynachart, 180, 250);
+    //lv_obj_set_style_size(dynachart, 2, LV_PART_INDICATOR);
+    // lv_obj_add_event_cb(dynachart, draw_event_cb, LV_EVENT_DRAW_PART_BEGIN, NULL);
+    lv_obj_set_style_line_width(dynachart, 3, LV_PART_ITEMS); /*Remove the lines*/
+
+    lv_chart_set_type(dynachart, LV_CHART_TYPE_SCATTER);
+
+    lv_chart_set_axis_tick(dynachart, LV_CHART_AXIS_PRIMARY_X, 10, 5, 5, 4, true, 30);
+    lv_chart_set_axis_tick(dynachart, LV_CHART_AXIS_PRIMARY_Y, 10, 5, 6, 5, true, 50);
+
+    lv_chart_set_range(dynachart, LV_CHART_AXIS_PRIMARY_X, 0, 100);
+    lv_chart_set_range(dynachart, LV_CHART_AXIS_PRIMARY_Y, -50, 1200);
+
+    lv_chart_set_point_count(dynachart, numberData);
+
+    lv_chart_series_t *ser = lv_chart_add_series(dynachart, lv_palette_main(LV_PALETTE_BROWN), LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_series_t *ser1 = lv_chart_add_series(dynachart, lv_palette_main(LV_PALETTE_GREEN), LV_CHART_AXIS_SECONDARY_Y);
+
+    /**/
+    for (uint32_t i = 0; i < numberData; i++)
+    {
+        lv_chart_set_next_value2(dynachart, ser, pp[i] * 100, a0[i] * 200);
+        //lv_chart_set_next_value2(dynachart, ser1, pos_surf[i] * 10, load_surf[i] * 100);
+        //lv_chart_set_next_value2(dynachart, ser, pp[i] * 420, a0[i] * 500);
+        lv_chart_set_next_value2(dynachart, ser1, pp[i] * 100, load.get(i) * 10);
+    }
+
+    // ***************** run time text *****************
+    lv_obj_t *box_runTime = lv_textarea_create(lv_scr_act());
+    lv_textarea_set_one_line(box_runTime, true);
+    lv_textarea_set_password_mode(box_runTime, false);
+    lv_obj_set_pos(box_runTime, 230, 50);
+    lv_obj_set_size(box_runTime, 85, 43);
+
+    auto label_rt_fill = lv_label_create(box_runTime);
+    lv_label_set_text(label_rt_fill, String(runTime,2).c_str());
+
+    lv_obj_center(label_rt_fill);
+    lv_obj_set_style_text_font(label_rt_fill, &lv_font_montserrat_22, LV_STATE_DEFAULT);
+
+    lv_obj_t *rt_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(rt_label, "Run Time:");
+    lv_obj_align_to(rt_label, box_runTime, LV_ALIGN_OUT_TOP_LEFT, 0, 0);
+
+    // ***************** Create fill text *****************
+    lv_obj_t *box_fill = lv_textarea_create(lv_scr_act());
+    lv_textarea_set_one_line(box_fill, true);
+    lv_textarea_set_password_mode(box_fill, false);
+    lv_obj_set_pos(box_fill, 230, 117);
+    lv_obj_set_size(box_fill, 85, 43);
+
+    auto label_box_fill = lv_label_create(box_fill);
+    lv_label_set_text(label_box_fill, String(fill,2).c_str());
+
+    lv_obj_center(label_box_fill);
+    lv_obj_set_style_text_font(label_box_fill, &lv_font_montserrat_22, LV_STATE_DEFAULT);
+
+    lv_obj_t *fill_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(fill_label, "Fill (%):");
+    lv_obj_align_to(fill_label, box_fill, LV_ALIGN_OUT_TOP_LEFT, 0, 0);
+
+    // ***************** Create SPM text *****************
+    lv_obj_t *box_SPM = lv_textarea_create(lv_scr_act());
+    lv_textarea_set_one_line(box_SPM, true);
+    lv_textarea_set_password_mode(box_SPM, false);
+    lv_obj_set_pos(box_SPM, 230, 184);
+    lv_obj_set_size(box_SPM, 85, 43);
+
+    auto label_box_SPM = lv_label_create(box_SPM);
+
+    lv_label_set_text(label_box_SPM, SPM.c_str());
+    lv_obj_center(label_box_SPM);
+    lv_obj_set_style_text_font(label_box_SPM, &lv_font_montserrat_22, LV_STATE_DEFAULT);
+
+    lv_obj_t *SPM_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(SPM_label, "SPM (Hz):");
+    lv_obj_align_to(SPM_label, box_SPM, LV_ALIGN_OUT_TOP_LEFT, 0, 0);
+
+    // ***************** Create PEAK LOAD *****************
+    lv_obj_t *box_peak = lv_textarea_create(lv_scr_act());
+    lv_textarea_set_one_line(box_peak, true);
+    lv_textarea_set_password_mode(box_peak, false);
+    lv_obj_set_pos(box_peak, 230, 251);
+    lv_obj_set_size(box_peak, 85, 43);
+
+    auto label_box_peak = lv_label_create(box_peak);
+
+    lv_label_set_text(label_box_peak, PeakLoad.c_str());
+    lv_obj_center(label_box_peak);
+    lv_obj_set_style_text_font(label_box_peak, &lv_font_montserrat_22, LV_STATE_DEFAULT);
+
+    lv_obj_t *Peak_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(Peak_label, "Peak (KLb):");
+    lv_obj_align_to(Peak_label, box_peak, LV_ALIGN_OUT_TOP_LEFT, 0, 0);
+
+    // ***************** Create MIN LOAD *****************
+    lv_obj_t *box_min = lv_textarea_create(lv_scr_act());
+    lv_textarea_set_one_line(box_min, true);
+    lv_textarea_set_password_mode(box_min, false);
+    lv_obj_set_pos(box_min, 230, 318);
+    lv_obj_set_size(box_min, 85, 43);
+
+    auto label_box_min = lv_label_create(box_min);
+
+    lv_label_set_text(label_box_min, MinLoad.c_str());
+    lv_obj_center(label_box_min);
+    lv_obj_set_style_text_font(label_box_min, &lv_font_montserrat_22, LV_STATE_DEFAULT);
+
+    lv_obj_t *Min_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(Min_label, "Min (KLb):");
+    lv_obj_align_to(Min_label, box_min, LV_ALIGN_OUT_TOP_LEFT, 0, 0);
+
+    // ***************** Create fillpump plot *****************
+    lv_obj_t *fillchart = lv_chart_create(lv_scr_act());
+    lv_obj_set_pos(fillchart, 45, 370);
+    lv_obj_set_size(fillchart, 270, 80);
+    // lv_obj_add_event_cb(fillchart, draw_event_cb, LV_EVENT_DRAW_PART_BEGIN, NULL);
+    lv_obj_set_style_line_width(fillchart, 1, LV_PART_ITEMS); /*Remove the lines*/
+    lv_obj_set_style_size(fillchart, 2, LV_PART_INDICATOR);
+
+    lv_chart_set_type(fillchart, LV_CHART_TYPE_SCATTER);
+    // lv_chart_set_update_mode(fillchart,LV_CHART_UPDATE_MODE_CIRCULAR);
+    // lv_chart_set_range(fillchart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+    // lv_chart_set_point_count(fillchart, 250);
+
+    lv_chart_set_axis_tick(fillchart, LV_CHART_AXIS_PRIMARY_X, 5, 5, 7, 5, true, 30);
+    lv_chart_set_axis_tick(fillchart, LV_CHART_AXIS_PRIMARY_Y, 2, 1, 2, 2, true, 10);
+
+    lv_chart_set_range(fillchart, LV_CHART_AXIS_PRIMARY_X, 0, 24.00);
+    lv_chart_set_range(fillchart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+
+    lv_chart_set_point_count(fillchart, 250);
+
+    lv_chart_series_t *ser2 = lv_chart_add_series(fillchart, lv_palette_main(LV_PALETTE_BROWN), LV_CHART_AXIS_PRIMARY_Y);
+
+    // lv_chart_set_next_value(posChart, pos_ser, pos_raw[cnt]*10);
+    
+    for (uint32_t i = 0; i < numberDataFill; i++)
+    {
+        lv_chart_set_next_value2(fillchart, ser2, dtFillPumpList.get(i), FillPumpList.get(i));
+    }
+    
+    // Set label tittle plot
+    auto plot_label = lv_label_create(lv_scr_act());
+    lv_obj_set_pos(plot_label, 10, 350);
+    lv_obj_set_style_text_color(plot_label, lv_palette_main(LV_PALETTE_BROWN), LV_STATE_DEFAULT);
+    lv_label_set_long_mode(plot_label, LV_LABEL_LONG_WRAP); /*Break the long lines*/
+    lv_obj_set_style_text_font(plot_label, &lv_font_montserrat_14, LV_STATE_DEFAULT);
+    lv_label_set_text(plot_label, "Fill pump for this day");
+}
+
+/* ************************* OPERATION SCREEN ************************ */
+void OperationScreen(int16_t numberData, int16_t numberDataFill)
+{
+    // Clear screen
+    lv_obj_clean(lv_scr_act());
+
+    // Create Header
+    static lv_style_t style_shadow;
+    auto Header = lv_obj_create(lv_scr_act());
+    lv_obj_add_style(Header, &style_shadow, 0);
+    lv_obj_set_pos(Header, 1, 1);
+    lv_obj_set_size(Header, 318, 30);
+
+    // Set label to WellName
+    auto WellName_label = lv_label_create(lv_scr_act());
+    lv_obj_set_pos(WellName_label, 7, 5);
+    lv_obj_set_style_text_color(WellName_label, lv_palette_main(LV_PALETTE_BROWN), LV_STATE_DEFAULT);
+    lv_label_set_long_mode(WellName_label, LV_LABEL_LONG_WRAP); /*Break the long lines*/
+    lv_obj_set_style_text_font(WellName_label, &lv_font_montserrat_22, LV_STATE_DEFAULT);
+
+    lv_label_set_text(WellName_label, WellName.c_str());
+
+    // Set label to DateTime
+    auto DateTime_label = lv_label_create(lv_scr_act());
+    lv_obj_set_pos(DateTime_label, 90, 5);
+    lv_obj_set_style_text_color(DateTime_label, lv_palette_main(LV_PALETTE_BROWN), LV_STATE_DEFAULT);
+    lv_label_set_long_mode(DateTime_label, LV_LABEL_LONG_WRAP); /*Break the long lines*/
+    lv_obj_set_style_text_font(DateTime_label, &lv_font_montserrat_22, LV_STATE_DEFAULT);
+
+    lv_label_set_text(DateTime_label, dt.c_str());
+
+    // ***************** Set label to Diagnosis *****************
+    auto Diagnosis_label = lv_label_create(lv_scr_act());
+    lv_obj_set_pos(Diagnosis_label, 10, 32);
+    lv_obj_set_style_text_color(Diagnosis_label, lv_palette_main(LV_PALETTE_DEEP_ORANGE), LV_STATE_DEFAULT);
+    lv_label_set_long_mode(Diagnosis_label, LV_LABEL_LONG_SCROLL_CIRCULAR); /*Circular scroll*/
+    lv_obj_set_width(Diagnosis_label, 300);
+    lv_obj_set_style_text_font(Diagnosis_label, &lv_font_montserrat_22, LV_STATE_DEFAULT);
 
     String Label_diagnosis = "";
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < 11; i++)
     {
-        if(v_diagnosis[i] == 1){
+        if(v_diagnosis[i] > 0.7){
             Label_diagnosis += label_diagnosis[i] + " - ";
         }
 
     }
 
     lv_label_set_text(Diagnosis_label, Label_diagnosis.c_str());
+    lv_label_set_text(Diagnosis_label, "servoil");
 
     // ***************** Create dynachart *****************
     lv_obj_t *dynachart = lv_chart_create(lv_scr_act());
@@ -858,7 +1115,7 @@ void OperationScreen(int16_t numberData, int16_t numberDataFill)
     lv_chart_set_axis_tick(dynachart, LV_CHART_AXIS_PRIMARY_X, 10, 5, 5, 4, true, 30);
     lv_chart_set_axis_tick(dynachart, LV_CHART_AXIS_PRIMARY_Y, 10, 5, 6, 5, true, 50);
 
-    lv_chart_set_range(dynachart, LV_CHART_AXIS_PRIMARY_X, 0, 430);
+    lv_chart_set_range(dynachart, LV_CHART_AXIS_PRIMARY_X, 0, 100);
     lv_chart_set_range(dynachart, LV_CHART_AXIS_PRIMARY_Y, -50, 650);
 
     lv_chart_set_point_count(dynachart, numberData);
@@ -869,8 +1126,9 @@ void OperationScreen(int16_t numberData, int16_t numberDataFill)
     /**/
     for (uint32_t i = 0; i < numberData; i++)
     {
-        lv_chart_set_next_value2(dynachart, ser, pp[i] * 420, a0[i] * 500);
-        //lv_chart_set_next_value2(dynachart, ser1, pos_surf[i] * 10, load_surf[i] * 100);
+        //lv_chart_set_next_value2(dynachart, ser, pp[i] * 420, a0[i] * 500);
+        lv_chart_set_next_value2(dynachart, ser, pp[i] * 100, load.get(i) * 100);
+        //lv_chart_set_next_value2(dynachart, ser1, pp[i] * 100, a0[i] * 100);
     }
 
     // ***************** Create fill text *****************
@@ -988,19 +1246,11 @@ void OperationScreen(int16_t numberData, int16_t numberDataFill)
     lv_label_set_text(plot_label, "Fill pump for this day");
 }
 
-/* ********************** SEND DATA *********************** */
-void sendData(String mqtt_payload)
-{
-    char payload[6000];
-    mqtt_payload.toCharArray(payload, (mqtt_payload.length() + 1));
-    mqtt.publish(topicPublish, payload);
-}
-
 /* ********************** ESP_NOW CALLBACK *********************** */
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
     char* buff = (char*) incomingData;        //char buffer
     String jsondata = String(buff);           //converting into STRING
-    Serial.println(jsondata);
+    //Serial.println(jsondata);
     appendFile(SD, "/data.txt", jsondata.c_str());
     
     StaticJsonDocument<96> docEN;
@@ -1024,22 +1274,21 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
     }
 
     else {
-        Serial.print(F("deserializeJson() failed: "));  //Just in case of an ERROR of ArduinoJSon
-        Serial.println(error.f_str());
+        //Serial.print(F("deserializeJson() failed: "));  //Just in case of an ERROR of ArduinoJSon
+        //Serial.println(error.f_str());
         return;
     }
     
 }
 
 /* ********************** WIRE RECEIVER MAIN *********************** */
-void wireReceiver(){
+void wireReceiver(String t_dt){
     ADS.begin();
     f = ADS.toVoltage(1) * 100;
     ADS.setDataRate(5);
 
-    pinMode(pinCC1W, OUTPUT);
-    digitalWrite(pinCC1W, HIGH);
-    delay(3000);
+    pcf8574.digitalWrite(P3, HIGH);
+    delay(4000);
 
     //AcquisitionScreen();
     //smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 255, .red = 0}}));
@@ -1053,7 +1302,11 @@ void wireReceiver(){
     
     end_time = millis() - start_time;
 
-    digitalWrite(pinCC1W, LOW);
+    pcf8574.digitalWrite(P3, LOW);
+
+    dataProcess();
+    saveSendDate(t_dt);
+    
 }
 
 /* ********************** ESP NOW RECEIVER MAIN*********************** */
@@ -1074,155 +1327,150 @@ void espNowReceiver(){
 
 void setup()
 {
-    Serial.begin(115200);
-    Serial.println(WiFi.macAddress());
-    smartdisplay_init();
+    //Serial.begin(115200);
+    //Serial.println(WiFi.macAddress());
+    
+    pcf8574.pinMode(P0, INPUT); // transmision mode
+    pcf8574.pinMode(P1, INPUT); // adquisition mode
+    pcf8574.pinMode(P2, OUTPUT); // reset sim800
+    pcf8574.pinMode(P3, OUTPUT); // CC1 available
+
+    /* ------- get date time from rtc ------- */
+    Wire.begin();
+    delay(1000);
+    DateTime now = myRTC.now();
+    char new_DT[25];
+    sprintf(new_DT, "%04d/%02d/%02d %02d:%02d:%02d", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+    dt = String(new_DT);
+    //Serial.println("Hora y Fecha: " + dt);
+
+    /* ------- create file path ------- */
+    char new_filePath[18];
+    sprintf(new_filePath, "/data_%04d_%02d_%02d.txt", now.year(), now.month(), now.day());
+    //Serial.println(String(new_filePath));
+
+    String t_dt = String(new_filePath);
+
     if(!SD.begin(5)){
-        smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 255, .green = 255, .red = 255}}));
+        //smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 255, .green = 255, .red = 255}}));
         return;
     }
 
-    ++bootCount;
+    delay(50);
 
+    readFile(SD, t_dt.c_str());
+
+    ++bootCount;
     esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
 
-    AcquisitionScreen();
+    if (pcf8574.begin()){
+		//Serial.println("OK");
+	}else{
+		//Serial.println("I2C io expander error.");
+	}
+
+    delay(50);
+
+    acquire_mode = pcf8574.digitalRead(P1);
+    delay(50);
+    transmission_mode = pcf8574.digitalRead(P0);
+
+    if (transmission_mode)
+    {
+        pcf8574.digitalWrite(P2, HIGH);
+        delay(1000);
+        modem.sleepEnable(true);
+        pcf8574.digitalWrite(P2, LOW);
+    }
+
+    smartdisplay_init();
+    AcquisitionScreen(50,nRecords);
     lv_timer_handler();
 
-    boolean mode = false;
-    if(mode){
-        smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 255, .red = 0}}));
-        wireReceiver();
+    if(acquire_mode){
+        //Serial.println("CC1 MODE");
+        smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 100, .green = 0, .red = 0}}));
+
+        wireReceiver(t_dt);
+
     }else{
-        smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 255, .green = 255, .red = 0}}));
+        //Serial.println("CC3 MODE - ESP NOW");
+        smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 100, .green = 100, .red = 0}}));
         espNowReceiver();
     }
 
-    if(mode == 1){
-        setup_wifi();
-        mqtt.setServer(broker, mqtt_port);
-        mqtt.setCallback(mqttCallback);
-        reconnect();
-    }
-    
-    // ================================ DETECT PUMP STOPPED ================================
-    
-    String mqtt_payload = "--";
-    /*
-    String mqtt_payload;
-    if (abs(maxPos - minPos) <= 0.5)
+    smartdisplay_set_led_color(lv_color32_t({.ch = {.blue = 0, .green = 0, .red = 0}}));
+}
+
+void loop2()
+{
+    if (Serial.available() > 0)
     {
-        mqtt_payload = "{\"well\":\"" + WellName + "\",\"status\":\"stopped\"}";
-        
-        sendData(mqtt_payload);
-        Diagnosis = "Stopped";
-        
-        lv_timer_handler();
-        lv_timer_handler();
-    }
-    else
-    {
-        // ================================ FILTER STROKE ================================
-        float value;
-        int16_t i_start = 0;
-        int16_t i_flag = 0;
-        int16_t i_end = 0;
-        float tp = 0;
-        float diff;
-        float range = maxPos - minPos;
+        String jsondata = Serial.readString();
 
-        for (int16_t i = 0; i < read_n_max - 1; i++)
+        StaticJsonDocument<96> docEN;
+        DeserializationError error = deserializeJson(docEN, jsondata);
+
+        if (!error)
         {
-            value = pos_raw[i];
-            diff = value - minPos;
-            if(diff > 0.8 * range && i_flag == 0 && i_end == 0){
-                if(diff > tp){
-                    tp = diff;
-                    i_start = i;
-                }
+            flag = docEN["f"];
+            if (flag == 0)
+            { // flag start acquire data
+                const char *tmp_dt = docEN["dt"];
+                dt = String(tmp_dt);
+                // lv_timer_reset(timer);
             }
-            else if (i_start != 0 && diff < 0.2 * range && i_end == 0){
-                if(diff < tp){
-                    tp = diff;
-                    i_flag = i;
-                }
+            else if (flag == 1)
+            { // flag acquire data //tmp_n = docEN["n"];
+                tmp_acc = docEN["a"];
+                tmp_load = docEN["l"];
+                // lv_timer_handler();
             }
-            else if(i_flag != 0 && diff > 0.8 * range){
-                if(diff > tp){
-                    tp = diff;
-                    i_end = i;
-                }
+            else if (flag == 2)
+            { // flag end acquire data
+                // dataProcess();
             }
-            else if(diff < 0.2 * range && i_end != 0){break;}
+            lv_timer_handler();
         }
-
-        String tempPeakLoad = String(rload.get(i_start-1), 2);
-        char payloadPeak[20];
-        tempPeakLoad.toCharArray(payloadPeak, (tempPeakLoad.length() + 1));
-        PeakLoad = payloadPeak;
-
-        String tempMinLoad = String(rload.get(i_flag-1), 2);
-        char payloadMin[20];
-        tempMinLoad.toCharArray(payloadMin, (tempMinLoad.length() + 1));
-        MinLoad = payloadMin;
-
-        //Serial.println( String(SPM) + ", " + String(PeakLoad) + ", " + String(MinLoad));
-
-        // ======== TRACE IN  STROKE ========        
-        load_ser->y_points[i_start + 1] = 1600;
-        load_ser->y_points[i_end + 1] = 1600;
-
-        pos_ser->y_points[i_start + 1] = 0;
-        pos_ser->y_points[i_end + 1] = 0;
-
-        lv_chart_refresh(loadChart);
-        lv_chart_refresh(posChart);
-
-        lv_timer_handler();
-        lv_timer_handler();
-
-        //Serial.println("markers: " + String(i_start) + "," + String(i_end) + "->" + String(min_pos_index) + "," + String(max_pos_index));
-
-        String rawdataPos = "";
-        String rawdataLoad = "";
-        int16_t cont = 0;
-        float t_pos = 0;
-        float t_load = 0;
-
-        for (uint16_t i = i_start; i < i_end-1; i++)
-        {
-            // mapfloat(long x, long in_min, long in_max, long out_min, long out_max)
-            t_pos = mapfloat(rload.get(i),280,290,0,42);
-            //t_pos = (cos(PI + mapfloat(cont,0,(i_end - i_start - 1),0,2*PI)) + 1) * 21;
-
-            t_load = mapfloat(rload.get(i),0,300,0,6.5);
-            //t_load = rload.get(i);
-            rawdataPos += String(t_pos, 2) + ",";
-            rawdataLoad += String(t_load, 2) + ",";
-
-            pos_surf[cont] = t_pos;
-            load_surf[cont] = t_load;
-
-            cont++;
-        }
-        //rawdataPos += String(rpos.get(i_end), 2);
-        t_pos = mapfloat(rload.get(i_end),280,290,0,42);
-        rawdataPos += String(0.00, 2);
-
-        t_load = mapfloat(rload.get(i_end),0,300,0,6.5);
-        rawdataLoad += String(t_load, 2);
-
-        mqtt_payload = "{\"well\":\"" + WellName + "\",\"status\":\"running\"" + ",\"rate\":\"" + String(end_time) + "\",\"pos\":\"" + rawdataPos + "\"" + ",\"load\":\"" + rawdataLoad + "\"}";
-        sendData(mqtt_payload);
     }
-    
-    */
-    //mqtt_payload = rtc.getDateTime() + "," + mqtt_payload + "\n";
-    appendFile(SD, "/data.txt", mqtt_payload.c_str());
 }
 
 void loop()
 {
+    //while (!Serial.available()); // Wait for input
+    //String name = Serial.readStringUntil('\n');
+    /*
+    if (Serial.available() > 0)
+    {
+        String jsondata = Serial.readStringUntil('\n');
+
+        StaticJsonDocument<96> docEN;
+        DeserializationError error = deserializeJson(docEN, jsondata);
+
+        if (!error)
+        {
+            flag = docEN["f"];
+            if (flag == 0)
+            { // flag start acquire data
+                const char *tmp_dt = docEN["dt"];
+                dt = String(tmp_dt);
+                // lv_timer_reset(timer);
+            }
+            else if (flag == 1)
+            { // flag acquire data //tmp_n = docEN["n"];
+                tmp_acc = docEN["a"];
+                tmp_load = docEN["l"];
+                // lv_timer_handler();
+            }
+            else if (flag == 2)
+            { // flag end acquire data
+                // dataProcess();
+            }
+            lv_timer_handler();
+        }
+    }*/
+}
+    /*
     if(mode == 1){
         if (!mqtt.connected())
         {
@@ -1231,16 +1479,19 @@ void loop()
 
         mqtt.loop();
     }
+    */
     
-    delay(10);
+    //delay(10);
 
-    unsigned long currentMillis = millis();
+    //unsigned long currentMillis = millis();
+
+
 
     /*
     
     if(currentMillis - previousMillis > 120000) {
         digitalWrite(pinCC1W,LOW);
-        gpio_hold_en(GPIO_NUM_1);
+        gpio_hold_en(GPIO_NUM_1);180/24
 
         digitalWrite(17,LOW);
         gpio_hold_en(GPIO_NUM_17);
@@ -1256,4 +1507,3 @@ void loop()
         previousMillis = currentMillis; 
     }
     */
-}
